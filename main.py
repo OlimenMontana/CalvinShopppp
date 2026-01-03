@@ -1,24 +1,19 @@
 import asyncio
 import logging
-import re
 import uuid 
 import random 
 import sqlite3
 import os
-from aiohttp import web # Для веб-сервера (Render требует порт)
+import html # Для экранирования текста
+from aiohttp import web 
 from aiogram import Bot, Dispatcher, types, F, Router
-from aiogram.filters import CommandStart, StateFilter, Command
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from typing import Dict, Any, Callable, Awaitable
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError 
-from aiogram.types import BotCommand, TelegramObject 
-from aiogram.enums import ChatAction 
-from aiogram.fsm.storage.memory import MemoryStorage
 
-# --- Конфигурация ---
+# --- КОНФИГУРАЦИЯ ---
 BOT_TOKEN = "8583363803:AAFtkD-J0vq8uR6kyJPxO00SH1TSn8fIDUo" 
 
 ADMIN_IDS = [
@@ -33,7 +28,7 @@ PAYMENT_CARDS = [
 
 DB_FILE = "shop.db"
 
-# --- Веб-сервер для Render (чтобы сервис не засыпал) ---
+# --- WEB SERVER (Для Render) ---
 async def handle(request):
     return web.Response(text="Bot is alive!")
 
@@ -42,14 +37,11 @@ async def start_webserver():
     app.router.add_get("/", handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render передает порт в переменную окружения PORT
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-# ----------------------------------------------------------------------
-# --- ЛОГИКА БАЗЫ ДАННЫХ ---
-# ----------------------------------------------------------------------
+# --- БАЗА ДАННЫХ ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -57,12 +49,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            referrer_id INTEGER,
-            referral_count INTEGER DEFAULT 0,
-            has_purchased INTEGER DEFAULT 0,
-            referral_reward_claimed INTEGER DEFAULT 0,
-            blocked_bot INTEGER DEFAULT 0 
+            referral_count INTEGER DEFAULT 0
         )
         """)
         cursor.execute("""
@@ -73,9 +60,7 @@ def init_db():
             username TEXT,
             product TEXT,
             weight TEXT,
-            original_price INTEGER,
             final_price INTEGER,
-            promo_code_used TEXT,
             contact_info TEXT,
             check_file_id TEXT,
             status TEXT DEFAULT 'pending',
@@ -84,26 +69,23 @@ def init_db():
         """)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS promo_codes (
-            code TEXT PRIMARY KEY NOT NULL UNIQUE,
-            discount_percent INTEGER NOT NULL,
-            is_reusable INTEGER DEFAULT 1,
-            owner_id INTEGER
+            code TEXT PRIMARY KEY,
+            discount_percent INTEGER,
+            is_reusable INTEGER DEFAULT 1
         )
         """)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category_name TEXT NOT NULL,
-            product_name TEXT NOT NULL,
-            weight TEXT NOT NULL,
-            price INTEGER NOT NULL
+            category_name TEXT,
+            product_name TEXT,
+            weight TEXT,
+            price INTEGER
         )
         """)
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS blacklist (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT,
-            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            user_id INTEGER PRIMARY KEY
         )
         """)
         conn.commit()
@@ -113,629 +95,457 @@ def populate_initial_products():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM products")
-        if cursor.fetchone()[0] > 0:
-            return
+        if cursor.fetchone()[0] > 0: return
         
+        # Начальные товары
         OLD_PRODUCTS = {
             "Шишки АК-47 (ИНДИКА)": { "1.0г": 400 },
-            "Шишки АК-47(САТИВА)": { "1.0г": 450 },
-            "Гашиш АФГАН": { "1.0г": 500 },
-            "Киф АФГАН": { "1.0г": 600 },
-            "Амфетамин VHQ": { "1.0г": 700 },
             "Мефедрон VHQ": { "1.0г": 700 },
-            "Метадон Уличный": { "1.0г": 800 },
-            "Экстази Домино": { "1 шт": 450 },
-            "Грибы": { "1.0г": 450 },
-            "ЛСД-300": { "1 шт.": 500 },
-            "МДМА": { "1.0г.": 500 },
-            "Alfa pvp": { "1.0г": 600 },
-            "Гер": { "0.5г": 900 },
-            "Винт": { "5мг": 1200 },
-            "Мушрум": { "1шт": 450 },
-            "Кетамин": { "1.0г": 500 },
-            "D-mesth": { "0.25г": 600 },
-            "Кокаин": { "0.25": 1000 },
+            "Alfa pvp": { "1.0г": 600 }
         }
-        for full_name, weights_dict in OLD_PRODUCTS.items():
-            parts = full_name.split(maxsplit=1)
-            category = parts[0] if len(parts) == 2 else full_name
-            product_name = parts[1] if len(parts) == 2 else full_name
-            for weight, price in weights_dict.items():
-                cursor.execute(
-                    "INSERT INTO products (category_name, product_name, weight, price) VALUES (?, ?, ?, ?)",
-                    (category.strip(), product_name.strip(), weight.strip(), price)
-                )
+        for full_name, weights in OLD_PRODUCTS.items():
+            cat = full_name.split()[0]
+            for w, p in weights.items():
+                cursor.execute("INSERT INTO products (category_name, product_name, weight, price) VALUES (?, ?, ?, ?)",
+                               (cat, full_name, w, p))
         conn.commit()
 
-# --- Вспомогательные функции БД ---
-def add_user_to_db(user_id: int, username: str, referrer_id: int | None = None):
+# --- SQL WRAPPERS ---
+def add_user(uid, uname, ref=None):
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?, ?, ?)", (user_id, username, referrer_id))
-        conn.commit()
+        conn.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (uid, uname))
+        if ref and ref != uid:
+             conn.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (ref,))
 
-def is_user_verified(user_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-        return cursor.fetchone() is not None
-
-def get_user_data_db(user_id: int) -> dict | None:
+def get_user(uid):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        return dict(conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone() or {})
 
-def get_user_count() -> int:
+def get_stats():
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(user_id) FROM users")
-        return cursor.fetchone()[0]
+        u = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        b = conn.execute("SELECT COUNT(*) FROM blacklist").fetchone()[0]
+        return u, b
 
-def get_all_user_ids_db() -> list[int]:
+def add_order(data):
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM users")
-        return [row[0] for row in cursor.fetchall()]
+        conn.execute("""INSERT INTO orders (order_id, short_id, user_id, username, product, weight, final_price, contact_info, check_file_id)
+        VALUES (:order_id, :short_id, :user_id, :username, :product, :weight, :final_price, :contact_info, :check_file_id)""", data)
 
-def set_user_has_purchased(user_id: int):
+def get_cats():
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET has_purchased = 1 WHERE user_id = ?", (user_id,))
-        conn.commit()
+        return [r[0] for r in conn.execute("SELECT DISTINCT category_name FROM products").fetchall()]
 
-def increment_referrer_count(referrer_id: int) -> int:
+def get_prods(cat):
     with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = ?", (referrer_id,))
-        conn.commit()
-        cursor.execute("SELECT referral_count FROM users WHERE user_id = ?", (referrer_id,))
-        result = cursor.fetchone()
-        return result[0] if result else 0
+        return [r[0] for r in conn.execute("SELECT DISTINCT product_name FROM products WHERE category_name=?", (cat,)).fetchall()]
 
-def reset_referral_count(user_id: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET referral_count = 0, referral_reward_claimed = referral_reward_claimed + 1 WHERE user_id = ?", (user_id,))
-        conn.commit()
-
-def set_user_blocked_bot_db(user_id: int):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET blocked_bot = 1 WHERE user_id = ?", (user_id,))
-        conn.commit()
-
-def get_blocked_bot_count_db() -> int:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users WHERE blocked_bot = 1")
-        return cursor.fetchone()[0]
-
-def add_to_blacklist_db(user_id: int, reason: str = 'Blocked by admin') -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT OR REPLACE INTO blacklist (user_id, reason) VALUES (?, ?)", (user_id, reason))
-            conn.commit()
-            return True
-        except: return False
-
-def remove_from_blacklist_db(user_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
-        conn.commit()
-        return cursor.rowcount > 0
-
-def is_user_blacklisted_db(user_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,))
-        return cursor.fetchone() is not None
-
-def get_blocked_user_count_db() -> int:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM blacklist")
-        return cursor.fetchone()[0]
-
-def create_db_order(order_data: dict) -> str:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-        INSERT INTO orders (order_id, short_id, user_id, username, product, weight, 
-                            original_price, final_price, promo_code_used, 
-                            contact_info, check_file_id, status)
-        VALUES (:order_id, :short_id, :user_id, :username, :product, :weight, 
-                :original_price, :final_price, :promo_code_used,
-                :contact_info, :check_file_id, 'pending')
-        """, order_data)
-        conn.commit()
-    return order_data['short_id']
-
-def get_pending_orders_db() -> list:
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row 
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at ASC")
-        return [dict(row) for row in cursor.fetchall()]
-
-def get_order_db(order_id: str) -> dict | None:
+def get_weights(name):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        return [dict(r) for r in conn.execute("SELECT * FROM products WHERE product_name=?", (name,)).fetchall()]
 
-def update_order_status_db(order_id: str, status: str) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE orders SET status = ? WHERE order_id = ?", (status, order_id))
-        conn.commit()
-        return cursor.rowcount > 0
-
-def add_promo_db(code: str, percent: int, is_reusable: bool = True, owner_id: int | None = None) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT OR REPLACE INTO promo_codes (code, discount_percent, is_reusable, owner_id) VALUES (?, ?, ?, ?)", 
-                (code.upper(), percent, int(is_reusable), owner_id))
-            conn.commit()
-            return True
-        except: return False
-
-def del_promo_db(code: str) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM promo_codes WHERE code = ?", (code.upper(),))
-        conn.commit()
-        return cursor.rowcount > 0 
-
-def get_promo_db(code: str) -> dict | None:
+def get_prod_by_id(pid):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM promo_codes WHERE code = ?", (code.upper(),))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+        return dict(conn.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone())
 
-def get_all_promos_db() -> list:
+def add_product_db(cat, name, weight, price):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("INSERT INTO products (category_name, product_name, weight, price) VALUES (?,?,?,?)", (cat, name, weight, price))
+
+def del_product_db(pid):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("DELETE FROM products WHERE id=?", (pid,))
+
+def get_all_products():
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM promo_codes")
-        return [dict(row) for row in cursor.fetchall()]
+        return [dict(r) for r in conn.execute("SELECT * FROM products").fetchall()]
 
-def get_product_categories_db() -> list[str]:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT category_name FROM products ORDER BY category_name")
-        return [row[0] for row in cursor.fetchall()]
+# --- FSM STATES ---
+class UserState(StatesGroup):
+    captcha = State()
+    cat = State()
+    prod = State()
+    weight = State()
+    promo = State()
+    pay = State()
+    contact = State()
+    support = State()
 
-def get_products_by_category_db(category_name: str) -> list[str]:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT product_name FROM products WHERE category_name = ? ORDER BY product_name", (category_name,))
-        return [row[0] for row in cursor.fetchall()]
+class AdminState(StatesGroup):
+    broadcast = State()
+    # Promo
+    promo_code = State()
+    promo_percent = State()
+    promo_del = State()
+    # Product
+    prod_cat = State()
+    prod_name = State()
+    prod_weight = State()
+    prod_price = State()
+    # Block
+    block_id = State()
+    unblock_id = State()
+    # Support
+    answer_user = State()
 
-def get_weights_for_product_db(product_name: str) -> list[dict]:
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, weight, price, category_name FROM products WHERE product_name = ? ORDER BY price", (product_name,))
-        return [dict(row) for row in cursor.fetchall()]
+# --- KEYBOARDS ---
+def main_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="🛍️ Каталог", callback_data="catalog")
+    b.button(text="👤 Профиль", callback_data="profile")
+    b.button(text="💬 Поддержка", callback_data="support")
+    return b.adjust(1).as_markup()
 
-def get_product_by_id_db(product_id: int) -> dict | None:
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
-        row = cursor.fetchone()
-        return dict(row) if row else None
+def admin_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="📊 Статистика", callback_data="adm:stats")
+    b.button(text="📣 Рассылка", callback_data="adm:broadcast")
+    b.button(text="🎟️ Промокоды", callback_data="adm:promo")
+    b.button(text="📦 Товары", callback_data="adm:products")
+    b.button(text="🚫 Бан", callback_data="adm:ban")
+    return b.adjust(1).as_markup()
 
-def add_product_db(category: str, name: str, weight: str, price: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        try:
-            cursor.execute("INSERT INTO products (category_name, product_name, weight, price) VALUES (?, ?, ?, ?)", (category, name, weight, price))
-            conn.commit()
-            return True
-        except: return False
+def cancel_kb(cb):
+    return InlineKeyboardBuilder().button(text="⬅️ Назад", callback_data=cb).as_markup()
 
-def get_all_products_full_db() -> list[dict]:
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM products ORDER BY category_name, product_name, price")
-        return [dict(row) for row in cursor.fetchall()]
-
-def delete_product_db(product_id: int) -> bool:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
-        conn.commit()
-        return cursor.rowcount > 0
-
-# --- FSM СОСТОЯНИЯ ---
-class AuthStates(StatesGroup):
-    waiting_for_captcha = State()
-
-class AdminStates(StatesGroup):
-    waiting_for_broadcast_message = State()
-    waiting_for_promo_code_name = State()
-    waiting_for_promo_code_percent = State()
-    waiting_for_promo_code_delete = State()
-    in_support = State()
-    waiting_for_product_category = State()
-    waiting_for_product_name = State()
-    waiting_for_product_weight = State()
-    waiting_for_product_price = State()
-    waiting_for_product_delete = State()
-    waiting_for_block_id = State()
-    waiting_for_unblock_id = State()
-
-class UserSupport(StatesGroup):
-    waiting_for_question = State()
-    in_support = State()
-
-class OrderStates(StatesGroup):
-    waiting_for_category = State()
-    waiting_for_product = State()
-    waiting_for_weight = State()
-    waiting_for_promo_code = State() 
-    waiting_for_payment_check = State()
-    waiting_for_contact = State() 
-
-# --- КЛАВИАТУРЫ ---
-def get_main_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🛍️ Каталог Товаров", callback_data="show_catalog")
-    builder.button(text="👤 Мой Профиль / Рефералы", callback_data="show_profile")
-    builder.button(text="💬 Написать Админу", callback_data="start_support")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_categories_keyboard(categories: list[str]):
-    builder = InlineKeyboardBuilder()
-    for cat in categories: builder.button(text=cat, callback_data=f"category:{cat}")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu_start"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_products_keyboard(products: list[str]):
-    builder = InlineKeyboardBuilder()
-    for prod in products: builder.button(text=prod, callback_data=f"product:{prod}")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="show_catalog"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_weights_keyboard(weights: list[dict]):
-    builder = InlineKeyboardBuilder()
-    cat = ""
-    for item in weights:
-        builder.button(text=f"{item['weight']} | {item['price']} грн", callback_data=f"weight:{item['id']}")
-        cat = item['category_name']
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"category:{cat}"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_promo_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Пропустить", callback_data="promo:skip")
-    return builder.as_markup()
-
-def get_user_cancel_support_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Отменить обращение ❌", callback_data="cancel_support")
-    return builder.as_markup()
-
-def get_user_close_chat_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Завершить чат 💬", callback_data="user_close_chat")
-    return builder.as_markup()
-
-def get_admin_close_chat_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="Завершить чат ❌", callback_data="admin_close_chat")
-    return builder.as_markup()
-
-def get_client_back_to_main_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад в Меню", callback_data="main_menu_start")
-    return builder.as_markup()
-
-def get_admin_order_keyboard(order_id: str):
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✅ Подтвердить", callback_data=f"admin:confirm:{order_id}")
-    builder.button(text="❌ Отклонить", callback_data=f"admin:decline:{order_id}")
-    return builder.as_markup()
-
-def get_admin_main_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📊 Статистика", callback_data="admin:stats")
-    builder.button(text="📣 Рассылка", callback_data="admin:broadcast")
-    builder.button(text="🎟️ Промокоды", callback_data="admin:promo_menu")
-    builder.button(text="📦 Товары", callback_data="admin:prod_menu")
-    builder.button(text="🚫 Бан", callback_data="admin:block_menu")
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_promo_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить", callback_data="promo:add")
-    builder.button(text="➖ Удалить", callback_data="promo:delete")
-    builder.button(text="📋 Список", callback_data="promo:list")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:main_menu"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_admin_back_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="⬅️ Назад", callback_data="admin:main_menu")
-    return builder.as_markup()
-
-def get_product_admin_menu():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить", callback_data="prod:add")
-    builder.button(text="➖ Удалить", callback_data="prod:delete_list")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:main_menu"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_product_delete_keyboard(products: list[dict]):
-    builder = InlineKeyboardBuilder()
-    if not products: builder.button(text="Пусто", callback_data="noop")
-    else:
-        for p in products: builder.button(text=f"❌ {p['product_name']} ({p['weight']})", callback_data=f"prod:del:{p['id']}")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:prod_menu"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-def get_block_menu_keyboard():
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Бан по ID", callback_data="block:add")
-    builder.button(text="➖ Разбан по ID", callback_data="block:remove")
-    builder.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:main_menu"))
-    builder.adjust(1)
-    return builder.as_markup()
-
-# --- ХЕНДЛЕРЫ ---
+# --- ROUTER ---
 router = Router()
 
-async def send_captcha(message: types.Message, state: FSMContext, referrer_id: int | None = None):
-    n1, n2 = random.randint(1, 10), random.randint(1, 10)
-    await state.update_data(captcha_answer=n1+n2, referrer_id=referrer_id)
-    await state.set_state(AuthStates.waiting_for_captcha)
-    await message.answer(f"🤖 Привет, {message.from_user.first_name}!\nРеши пример: **{n1} + {n2} = ?**")
-
-async def show_main_menu(m_or_c: types.Message | types.CallbackQuery, state: FSMContext, name: str):
-    await state.clear()
-    txt, kb = f"🛍️ **{name}, Главное меню**", get_main_menu_keyboard()
-    if isinstance(m_or_c, types.CallbackQuery):
-        try:
-            await m_or_c.message.answer(txt, reply_markup=kb)
-            await m_or_c.message.delete()
-        except: pass
-    else: await m_or_c.answer(txt, reply_markup=kb)
-
-async def show_catalog(cb_or_m: types.CallbackQuery | types.Message, state: FSMContext, bot: Bot):
-    await state.set_state(OrderStates.waiting_for_category)
-    cats = get_product_categories_db()
-    txt, kb = ("🛍️ Выберите категорию:", get_categories_keyboard(cats)) if cats else ("Пусто", get_client_back_to_main_menu_keyboard())
-    if isinstance(cb_or_m, types.CallbackQuery): await cb_or_m.message.edit_text(txt, reply_markup=kb)
-    else: await cb_or_m.answer(txt, reply_markup=kb)
-
-async def send_payment_instructions(message: types.Message, state: FSMContext, bot: Bot):
-    await state.set_state(OrderStates.waiting_for_payment_check)
-    d = await state.get_data()
-    card = random.choice(PAYMENT_CARDS)
-    txt = (f"🔥 **Заказ:** {d['chosen_product']} ({d['chosen_weight']})\n"
-           f"Цена: **{d['final_price']} грн**\n\n"
-           f"Карта для оплаты: `{card}`\n\n"
-           f"Пришли скриншот чека.")
-    await message.answer(txt, reply_markup=get_client_back_to_main_menu_keyboard())
-
-async def process_new_order(message: types.Message, state: FSMContext, bot: Bot, contact: str):
-    d = await state.get_data()
-    oid, sid = str(uuid.uuid4()), str(uuid.uuid4())[:8]
-    order_data = {
-        "order_id": oid, "short_id": sid, "user_id": message.from_user.id, "username": message.from_user.username or 'Нет',
-        "product": d['chosen_product'], "weight": d['chosen_weight'], "original_price": d['original_price'],
-        "final_price": d['final_price'], "promo_code_used": d.get('promo_code_used'),
-        "contact_info": contact, "check_file_id": d['payment_check_file_id']
-    }
-    create_db_order(order_data)
-    cap = f"🚨 **ЗАКАЗ #{sid}**\n{d['chosen_product']} | {d['final_price']}грн\nКонтакт: {contact}"
-    for aid in ADMIN_IDS:
-        try: await bot.send_photo(aid, d['payment_check_file_id'], caption=cap, reply_markup=get_admin_order_keyboard(oid))
-        except: pass
-    await message.answer(f"🎉 Заказ #{sid} принят!")
-    await show_main_menu(message, state, message.from_user.first_name)
-
+# 1. START & CAPTCHA
 @router.message(CommandStart())
-async def cmd_start(m: types.Message, s: FSMContext):
-    ref = None
-    try: ref = int(m.text.split()[1]) if len(m.text.split()) > 1 else None
-    except: pass
-    if is_user_verified(m.from_user.id): await show_main_menu(m, s, m.from_user.first_name)
-    else: await send_captcha(m, s, ref)
-
-@router.message(AuthStates.waiting_for_captcha, F.text)
-async def proc_captcha(m: types.Message, s: FSMContext):
-    d = await s.get_data()
-    if m.text.strip() == str(d.get('captcha_answer')):
-        add_user_to_db(m.from_user.id, m.from_user.username, d.get('referrer_id'))
-        await m.answer("✅ Верно!")
-        await show_main_menu(m, s, m.from_user.first_name)
-    else: await m.answer("❌ Неверно"); await send_captcha(m, s, d.get('referrer_id'))
-
-@router.callback_query(F.data == "main_menu_start")
-async def cb_main(c: types.CallbackQuery, s: FSMContext): await show_main_menu(c, s, c.from_user.first_name)
-
-@router.callback_query(F.data == "show_catalog")
-async def cb_cat(c: types.CallbackQuery, s: FSMContext, bot: Bot): await show_catalog(c, s, bot)
-
-@router.callback_query(F.data == "show_profile")
-async def cb_prof(c: types.CallbackQuery, bot: Bot):
-    u = get_user_data_db(c.from_user.id)
-    me = await bot.get_me()
-    lnk = f"https://t.me/{me.username}?start={c.from_user.id}"
-    txt = f"👤 ID: `{c.from_user.id}`\nРефералов: {u['referral_count']}/5\nСсылка: `{lnk}`"
-    await c.message.edit_text(txt, reply_markup=get_client_back_to_main_menu_keyboard())
-
-@router.callback_query(F.data.startswith("category:"))
-async def cb_sel_cat(c: types.CallbackQuery, s: FSMContext):
-    cat = c.data.split(":")[1]
-    await s.update_data(chosen_category=cat)
-    await s.set_state(OrderStates.waiting_for_product)
-    prods = get_products_by_category_db(cat)
-    await c.message.edit_text(f"Выбрано: {cat}. Выберите товар:", reply_markup=get_products_keyboard(prods))
-
-@router.callback_query(F.data.startswith("product:"))
-async def cb_sel_prod(c: types.CallbackQuery, s: FSMContext):
-    p = c.data.split(":")[1]
-    await s.set_state(OrderStates.waiting_for_weight)
-    ws = get_weights_for_product_db(p)
-    await c.message.edit_text(f"Товар: {p}. Выберите вес:", reply_markup=get_weights_keyboard(ws))
-
-@router.callback_query(F.data.startswith("weight:"))
-async def cb_sel_w(c: types.CallbackQuery, s: FSMContext, bot: Bot):
-    pid = int(c.data.split(":")[1])
-    p = get_product_by_id_db(pid)
-    await s.update_data(chosen_product=p['product_name'], chosen_weight=p['weight'], original_price=p['price'], final_price=p['price'])
-    await s.set_state(OrderStates.waiting_for_promo_code)
-    await c.message.edit_text(f"Цена: {p['price']}грн. Введите промокод или пропустите:", reply_markup=get_promo_keyboard())
-
-@router.callback_query(F.data == "promo:skip")
-async def cb_skip_p(c: types.CallbackQuery, s: FSMContext, bot: Bot): await send_payment_instructions(c.message, s, bot)
-
-@router.message(OrderStates.waiting_for_promo_code, F.text)
-async def proc_promo(m: types.Message, s: FSMContext, bot: Bot):
-    p = get_promo_db(m.text.strip())
-    if p:
-        d = await s.get_data()
-        new_p = round(d['original_price'] * (1 - p['discount_percent']/100))
-        await s.update_data(final_price=new_p, promo_code_used=m.text.strip().upper())
-        if not p['is_reusable']: del_promo_db(m.text.strip())
-        await m.answer(f"✅ Скидка {p['discount_percent']}%!")
-        await send_payment_instructions(m, s, bot)
-    else: await m.answer("❌ Нет такого кода.")
-
-@router.message(F.photo, OrderStates.waiting_for_payment_check)
-async def proc_check(m: types.Message, s: FSMContext, bot: Bot):
-    await s.update_data(payment_check_file_id=m.photo[-1].file_id)
-    if m.from_user.username: await process_new_order(m, s, bot, f"@{m.from_user.username}")
+async def cmd_start(m: types.Message, state: FSMContext):
+    user = get_user(m.from_user.id)
+    if user:
+        await m.answer(f"👋 Привет, <b>{html.escape(m.from_user.first_name)}</b>!", reply_markup=main_kb())
     else:
-        await s.set_state(OrderStates.waiting_for_contact)
-        await m.answer("Пришли номер телефона для связи.")
+        n1, n2 = random.randint(1,5), random.randint(1,5)
+        await state.update_data(cap=n1+n2)
+        ref = m.text.split()[1] if len(m.text.split()) > 1 else None
+        await state.update_data(ref=ref)
+        await state.set_state(UserState.captcha)
+        await m.answer(f"🤖 Проверка: сколько будет {n1} + {n2}?")
 
-@router.message(OrderStates.waiting_for_contact)
-async def proc_cont(m: types.Message, s: FSMContext, bot: Bot):
-    await process_new_order(m, s, bot, m.text or m.contact.phone_number)
+@router.message(UserState.captcha)
+async def captcha_check(m: types.Message, state: FSMContext):
+    d = await state.get_data()
+    if m.text.strip() == str(d['cap']):
+        add_user(m.from_user.id, m.from_user.username, d.get('ref'))
+        await state.clear()
+        await m.answer("✅ Доступ разрешен!", reply_markup=main_kb())
+    else:
+        await m.answer("❌ Ошибка. Попробуйте /start заново.")
 
-# --- ПОДДЕРЖКА ---
-@router.callback_query(F.data == "start_support")
-async def cb_sup(c: types.CallbackQuery, s: FSMContext):
-    await s.set_state(UserSupport.waiting_for_question)
-    await c.message.edit_text("Опиши проблему:", reply_markup=get_client_back_to_main_menu_keyboard())
+# 2. MAIN MENU
+@router.callback_query(F.data == "main_menu")
+async def back_main(c: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text(f"👋 Привет, <b>{html.escape(c.from_user.first_name)}</b>!", reply_markup=main_kb())
 
-@router.message(UserSupport.waiting_for_question)
-async def sup_q(m: types.Message, s: FSMContext, bot: Bot):
-    kb = InlineKeyboardBuilder().button(text="Ответить", callback_data=f"admin_reply_to:{m.from_user.id}").as_markup()
-    for aid in ADMIN_IDS:
-        try: await m.copy_to(aid); await bot.send_message(aid, f"От: @{m.from_user.username}", reply_markup=kb)
+@router.callback_query(F.data == "profile")
+async def show_profile(c: types.CallbackQuery, bot: Bot):
+    u = get_user(c.from_user.id)
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={c.from_user.id}"
+    await c.message.edit_text(
+        f"👤 <b>Ваш ID:</b> <code>{c.from_user.id}</code>\n"
+        f"👥 <b>Рефералов:</b> {u.get('referral_count', 0)}\n"
+        f"🔗 <b>Ссылка:</b> <code>{link}</code>",
+        reply_markup=cancel_kb("main_menu"), parse_mode="HTML"
+    )
+
+# 3. CATALOG & BUYING
+@router.callback_query(F.data == "catalog")
+async def show_cats(c: types.CallbackQuery):
+    cats = get_cats()
+    b = InlineKeyboardBuilder()
+    for cat in cats: b.button(text=cat, callback_data=f"cat:{cat}")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu"))
+    await c.message.edit_text("🛍️ Выберите категорию:", reply_markup=b.adjust(1).as_markup())
+
+@router.callback_query(F.data.startswith("cat:"))
+async def show_prods(c: types.CallbackQuery, state: FSMContext):
+    cat = c.data.split(":")[1]
+    await state.update_data(cat=cat)
+    prods = get_prods(cat)
+    b = InlineKeyboardBuilder()
+    for p in prods: b.button(text=p, callback_data=f"prod:{p}")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog"))
+    await c.message.edit_text(f"📂 Категория: {cat}", reply_markup=b.adjust(1).as_markup())
+
+@router.callback_query(F.data.startswith("prod:"))
+async def show_weights(c: types.CallbackQuery, state: FSMContext):
+    pname = c.data.split(":")[1]
+    weights = get_weights(pname)
+    b = InlineKeyboardBuilder()
+    for w in weights: 
+        b.button(text=f"{w['weight']} - {w['price']} грн", callback_data=f"w:{w['id']}")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cat:{weights[0]['category_name']}"))
+    await c.message.edit_text(f"💊 Товар: {pname}", reply_markup=b.adjust(1).as_markup())
+
+@router.callback_query(F.data.startswith("w:"))
+async def ask_promo(c: types.CallbackQuery, state: FSMContext):
+    pid = c.data.split(":")[1]
+    prod = get_prod_by_id(pid)
+    await state.update_data(prod=prod, final_price=prod['price'])
+    await state.set_state(UserState.promo)
+    b = InlineKeyboardBuilder().button(text="Пропустить", callback_data="skip_promo")
+    await c.message.edit_text(f"💳 К оплате: <b>{prod['price']} грн</b>\n👇 Введите промокод или нажмите Пропустить:", reply_markup=b.as_markup(), parse_mode="HTML")
+
+@router.message(UserState.promo)
+async def check_promo(m: types.Message, state: FSMContext):
+    code = m.text.strip()
+    with sqlite3.connect(DB_FILE) as conn:
+        res = conn.execute("SELECT * FROM promo_codes WHERE code=?", (code,)).fetchone()
+    
+    if res:
+        d = await state.get_data()
+        disc = int(res[1])
+        new_price = int(d['final_price'] * (1 - disc/100))
+        await state.update_data(final_price=new_price, promo=code)
+        await m.answer(f"✅ Скидка {disc}% применена!")
+        await send_pay_info(m, state, new_price)
+    else:
+        await m.answer("❌ Неверный код. Попробуйте еще или нажмите Пропустить.")
+
+@router.callback_query(F.data == "skip_promo")
+async def skip_promo_cb(c: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    await send_pay_info(c.message, state, d['final_price'])
+
+async def send_pay_info(m: types.Message, state: FSMContext, price):
+    card = random.choice(PAYMENT_CARDS)
+    await state.set_state(UserState.pay)
+    msg = (f"💳 Переведите <b>{price} грн</b> на карту:\n"
+           f"<code>{card}</code>\n\n"
+           f"⚠️ После оплаты пришлите <b>скриншот чека</b>.")
+    if isinstance(m, types.CallbackQuery): await m.message.edit_text(msg, parse_mode="HTML") # Fix for callback
+    else: await m.answer(msg, parse_mode="HTML")
+
+@router.message(UserState.pay, F.photo)
+async def get_check(m: types.Message, state: FSMContext, bot: Bot):
+    await state.update_data(check_id=m.photo[-1].file_id)
+    await state.set_state(UserState.contact)
+    await m.answer("📞 Теперь отправьте ваш номер телефона или @username для связи.")
+
+@router.message(UserState.contact)
+async def finish_order(m: types.Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    contact = m.text or "No contact"
+    oid = str(uuid.uuid4())
+    sid = oid[:8]
+    
+    add_order({
+        "order_id": oid, "short_id": sid, "user_id": m.from_user.id,
+        "username": m.from_user.username, "product": d['prod']['product_name'],
+        "weight": d['prod']['weight'], "final_price": d['final_price'],
+        "contact_info": contact, "check_file_id": d['check_id']
+    })
+    
+    # Notify Admins
+    for admin in ADMIN_IDS:
+        try:
+            txt = f"🚨 <b>НОВЫЙ ЗАКАЗ #{sid}</b>\n👤 {contact}\n🛒 {d['prod']['product_name']} ({d['prod']['weight']})\n💰 {d['final_price']} грн"
+            kb = InlineKeyboardBuilder()
+            kb.button(text="✅ Подтвердить", callback_data=f"adm_ok:{oid}")
+            await bot.send_photo(admin, d['check_id'], caption=txt, reply_markup=kb.as_markup(), parse_mode="HTML")
         except: pass
-    await s.set_state(UserSupport.in_support)
-    await m.answer("Отправлено.")
+        
+    await m.answer("✅ Заказ принят! Ожидайте подтверждения.", reply_markup=main_kb())
+    await state.clear()
 
-@router.callback_query(F.data.startswith("admin_reply_to:"), F.from_user.id.in_(ADMIN_IDS))
-async def adm_r(c: types.CallbackQuery, s: FSMContext, bot: Bot, dp: Dispatcher):
-    uid = int(c.data.split(":")[1])
-    await s.set_state(AdminStates.in_support)
-    await s.update_data(chatting_with_user_id=uid)
-    await c.message.answer(f"Чат с {uid}", reply_markup=get_admin_close_chat_keyboard())
-    await bot.send_message(uid, "Админ на связи.")
+# 4. SUPPORT
+@router.callback_query(F.data == "support")
+async def start_sup(c: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserState.support)
+    await c.message.edit_text("✍️ Напишите ваш вопрос:", reply_markup=cancel_kb("main_menu"))
 
-@router.message(AdminStates.in_support, F.from_user.id.in_(ADMIN_IDS))
-async def adm_msg(m: types.Message, s: FSMContext, bot: Bot):
-    d = await s.get_data()
-    try: await m.copy_to(d['chatting_with_user_id'], reply_markup=get_user_close_chat_keyboard())
-    except: pass
-
-@router.message(UserSupport.in_support)
-async def usr_msg(m: types.Message, s: FSMContext, bot: Bot):
-    for aid in ADMIN_IDS:
-        try: await m.copy_to(aid)
+@router.message(UserState.support)
+async def send_to_admin(m: types.Message, bot: Bot):
+    kb = InlineKeyboardBuilder().button(text="Ответить", callback_data=f"ans:{m.from_user.id}").as_markup()
+    for admin in ADMIN_IDS:
+        try: await m.copy_to(admin, reply_markup=kb)
         except: pass
+    await m.answer("Сообщение отправлено!")
 
-@router.callback_query(F.data == "admin_close_chat")
-async def adm_cls(c: types.CallbackQuery, s: FSMContext, bot: Bot):
-    d = await s.get_data(); await s.clear(); await bot.send_message(d['chatting_with_user_id'], "Чат закрыт."); await c.message.answer("Закрыто.")
+# --- ADMIN PANEL LOGIC ---
 
-# --- АДМИНКА ---
-@router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
-async def adm_p(m: types.Message): await m.answer("🛡️ Админка", reply_markup=get_admin_main_keyboard())
+@router.message(Command("admin"))
+async def admin_start(m: types.Message):
+    if m.from_user.id in ADMIN_IDS:
+        await m.answer("🛡️ Админ-панель", reply_markup=admin_kb())
 
-@router.callback_query(F.data == "admin:main_menu")
-async def adm_m(c: types.CallbackQuery, s: FSMContext): await s.clear(); await c.message.edit_text("🛡️ Админка", reply_markup=get_admin_main_keyboard())
+@router.callback_query(F.data == "admin_menu")
+async def back_admin(c: types.CallbackQuery):
+    await c.message.edit_text("🛡️ Админ-панель", reply_markup=admin_kb())
 
-@router.callback_query(F.data == "admin:stats")
-async def adm_s(c: types.CallbackQuery):
-    txt = f"Юзеров: {get_user_count()}\nБанов: {get_blocked_user_count_db()}"
-    await c.message.edit_text(txt, reply_markup=get_admin_back_keyboard())
+# A. Stats
+@router.callback_query(F.data == "adm:stats")
+async def show_stats(c: types.CallbackQuery):
+    u, b = get_stats()
+    await c.message.edit_text(f"📊 <b>Статистика:</b>\n👥 Юзеров: {u}\n🚫 В бане: {b}", 
+                              reply_markup=cancel_kb("admin_menu"), parse_mode="HTML")
 
-@router.callback_query(F.data == "admin:broadcast")
-async def adm_b(c: types.CallbackQuery, s: FSMContext):
-    await s.set_state(AdminStates.waiting_for_broadcast_message)
-    await c.message.edit_text("Пришли сообщение для рассылки:")
+# B. Products
+@router.callback_query(F.data == "adm:products")
+async def adm_prods(c: types.CallbackQuery):
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Добавить", callback_data="prod:add")
+    b.button(text="➖ Удалить", callback_data="prod:del_menu")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu"))
+    await c.message.edit_text("📦 Управление товарами", reply_markup=b.adjust(1).as_markup())
 
-@router.message(AdminStates.waiting_for_broadcast_message)
-async def proc_b(m: types.Message, s: FSMContext, bot: Bot):
-    ids = get_all_user_ids_db()
-    for uid in ids:
-        try: await m.copy_to(uid); await asyncio.sleep(0.05)
+@router.callback_query(F.data == "prod:add")
+async def add_prod_start(c: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminState.prod_cat)
+    await c.message.edit_text("Введите категорию товара:")
+
+@router.message(AdminState.prod_cat)
+async def get_cat(m: types.Message, state: FSMContext):
+    await state.update_data(cat=m.text)
+    await state.set_state(AdminState.prod_name)
+    await m.answer("Введите название товара:")
+
+@router.message(AdminState.prod_name)
+async def get_name(m: types.Message, state: FSMContext):
+    await state.update_data(name=m.text)
+    await state.set_state(AdminState.prod_weight)
+    await m.answer("Введите вес/фасовку (напр. 1.0г):")
+
+@router.message(AdminState.prod_weight)
+async def get_weight(m: types.Message, state: FSMContext):
+    await state.update_data(weight=m.text)
+    await state.set_state(AdminState.prod_price)
+    await m.answer("Введите цену (число):")
+
+@router.message(AdminState.prod_price)
+async def save_prod(m: types.Message, state: FSMContext):
+    try:
+        price = int(m.text)
+        d = await state.get_data()
+        add_product_db(d['cat'], d['name'], d['weight'], price)
+        await m.answer("✅ Товар добавлен!", reply_markup=admin_kb())
+        await state.clear()
+    except:
+        await m.answer("❌ Цена должна быть числом.")
+
+@router.callback_query(F.data == "prod:del_menu")
+async def del_prod_menu(c: types.CallbackQuery):
+    prods = get_all_products()
+    b = InlineKeyboardBuilder()
+    for p in prods:
+        b.button(text=f"❌ {p['product_name']} ({p['weight']})", callback_data=f"del_p:{p['id']}")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:products"))
+    await c.message.edit_text("Нажми, чтобы удалить:", reply_markup=b.adjust(1).as_markup())
+
+@router.callback_query(F.data.startswith("del_p:"))
+async def delete_process(c: types.CallbackQuery):
+    pid = c.data.split(":")[1]
+    del_product_db(pid)
+    await c.answer("Удалено!")
+    await adm_prods(c) # Refresh menu
+
+# C. Promo Codes
+@router.callback_query(F.data == "adm:promo")
+async def adm_promo(c: types.CallbackQuery):
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ Создать промокод", callback_data="promo:new")
+    b.row(types.InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_menu"))
+    await c.message.edit_text("🎟️ Промокоды", reply_markup=b.as_markup())
+
+@router.callback_query(F.data == "promo:new")
+async def new_promo(c: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminState.promo_code)
+    await c.message.edit_text("Введите код (слово):")
+
+@router.message(AdminState.promo_code)
+async def save_promo_code(m: types.Message, state: FSMContext):
+    await state.update_data(code=m.text)
+    await state.set_state(AdminState.promo_percent)
+    await m.answer("Введите процент скидки (1-99):")
+
+@router.message(AdminState.promo_percent)
+async def save_promo_fin(m: types.Message, state: FSMContext):
+    try:
+        perc = int(m.text)
+        d = await state.get_data()
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT INTO promo_codes (code, discount_percent) VALUES (?,?)", (d['code'], perc))
+        await m.answer("✅ Промокод создан!", reply_markup=admin_kb())
+        await state.clear()
+    except: await m.answer("Ошибка. Введите число.")
+
+# D. Ban System
+@router.callback_query(F.data == "adm:ban")
+async def adm_ban(c: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AdminState.block_id)
+    await c.message.edit_text("Введите ID пользователя для бана:", reply_markup=cancel_kb("admin_menu"))
+
+@router.message(AdminState.block_id)
+async def ban_user(m: types.Message, state: FSMContext):
+    try:
+        uid = int(m.text)
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("INSERT OR REPLACE INTO blacklist (user_id) VALUES (?)", (uid,))
+        await m.answer(f"🚫 Пользователь {uid} забанен.", reply_markup=admin_kb())
+        await state.clear()
+    except: await m.answer("Нужен цифровой ID.")
+
+# E. Admin Reply to Support
+@router.callback_query(F.data.startswith("ans:"))
+async def adm_answer_start(c: types.CallbackQuery, state: FSMContext):
+    uid = c.data.split(":")[1]
+    await state.update_data(uid=uid)
+    await state.set_state(AdminState.answer_user)
+    await c.message.answer(f"✍️ Введите ответ для {uid}:")
+
+@router.message(AdminState.answer_user)
+async def adm_send_answer(m: types.Message, state: FSMContext, bot: Bot):
+    d = await state.get_data()
+    try:
+        await bot.send_message(d['uid'], f"🔔 <b>Ответ поддержки:</b>\n{m.text}", parse_mode="HTML")
+        await m.answer("Отправлено!")
+    except:
+        await m.answer("Не удалось отправить (юзер заблочил бота).")
+    await state.clear()
+
+# F. Confirm Order
+@router.callback_query(F.data.startswith("adm_ok:"))
+async def confirm_order(c: types.CallbackQuery, bot: Bot):
+    oid = c.data.split(":")[1]
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE orders SET status='confirmed' WHERE order_id=?", (oid,))
+        row = conn.execute("SELECT user_id, short_id FROM orders WHERE order_id=?", (oid,)).fetchone()
+    
+    if row:
+        try: await bot.send_message(row[0], f"✅ Ваш заказ #{row[1]} подтвержден! Ждите клад/доставку.")
         except: pass
-    await m.answer("Готово!"); await s.clear()
+    await c.message.edit_caption(caption=c.message.caption + "\n\n✅ <b>ПОДТВЕРЖДЕНО</b>", parse_mode="HTML")
 
-@router.callback_query(F.data.startswith("admin:confirm:"))
-async def adm_conf(c: types.CallbackQuery, bot: Bot):
-    oid = c.data.split(":")[2]
-    o = get_order_db(oid)
-    if o and o['status'] == 'pending':
-        update_order_status_db(oid, "confirmed")
-        try: await bot.send_message(o['user_id'], f"✅ Заказ #{o['short_id']} подтвержден!")
-        except: pass
-        await c.message.edit_caption(caption=c.message.caption + "\n✅ ОК")
-
-# --- MIDDLEWARES ---
-class DpMiddleware:
-    def __init__(self, dp: Dispatcher): self.dp = dp
-    async def __call__(self, handler, event, data):
-        data['dp'] = self.dp
-        return await handler(event, data)
-
+# --- MIDDLEWARE (Blacklist) ---
 class BlacklistMiddleware:
     async def __call__(self, handler, event, data):
-        uid = event.from_user.id if hasattr(event, 'from_user') else None
-        if uid and uid not in ADMIN_IDS and is_user_blacklisted_db(uid): return
+        if isinstance(event, (types.Message, types.CallbackQuery)):
+            uid = event.from_user.id
+            if uid not in ADMIN_IDS:
+                with sqlite3.connect(DB_FILE) as conn:
+                    if conn.execute("SELECT 1 FROM blacklist WHERE user_id=?", (uid,)).fetchone():
+                        return
         return await handler(event, data)
 
-# --- ЗАПУСК ---
+# --- STARTUP ---
 async def main():
     init_db()
-    # Запускаем веб-сервер
     asyncio.create_task(start_webserver())
     
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-    dp.update.middleware(DpMiddleware(dp))
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    dp = Dispatcher()
     dp.update.middleware(BlacklistMiddleware())
+    dp.include_router(router)
     
-    await bot.set_my_commands([BotCommand(command="start", description="Старт"), BotCommand(command="admin", description="Админ")])
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
