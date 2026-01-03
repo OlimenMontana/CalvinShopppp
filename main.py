@@ -15,7 +15,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # --- КОНФИГ ---
 BOT_TOKEN = "8583363803:AAFtkD-J0vq8uR6kyJPxO00SH1TSn8fIDUo"
 ADMIN_IDS = [1945747968, 6928797177]
-DB_URL = "postgresql://shop_db_user_user:PbLeivrMYwfcB8qFfL2VdbVXRKFNbZ89@dpg-d5cq2heuk2gs738ej7og-a/shop_db_user" 
+DB_URL = "postgresql://shop_db_user_uefj_user:7qQoHt898FxFN7gXwLZa2ye4aC2nJ8O1@dpg-d5cqlaf5r7bs73besps0-a/shop_db_user_uefj" 
 PAYMENT_CARDS = ["5355 2800 2484 3821", "5232 4410 2403 2182"]
 
 # --- СОСТОЯНИЯ ---
