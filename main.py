@@ -1,8 +1,9 @@
 import asyncio
 import logging
-import uuid
-import random
-import psycopg2
+import re
+import uuid 
+import random 
+import psycopg2 
 from psycopg2.extras import DictCursor
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import CommandStart, StateFilter, Command
@@ -10,225 +11,286 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramForbiddenError, TelegramAPIError
+from aiogram.types import BotCommand, TelegramObject
+from aiogram.enums import ChatAction
 from aiogram.fsm.storage.memory import MemoryStorage
 
-# --- КОНФИГ ---
-BOT_TOKEN = "8583363803:AAFtkD-J0vq8uR6kyJPxO00SH1TSn8fIDUo"
+# --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = "8583363803:AAFtkD-J0vq8uR6kyJPxO00SH1TSn8fIDUo" 
 ADMIN_IDS = [1945747968, 6928797177]
-DB_URL = "postgresql://shop_db_user_uefj_user:7qQoHt898FxFN7gXwLZa2ye4aC2nJ8O1@dpg-d5cqlaf5r7bs73besps0-a.virginia-postgres.render.com/shop_db_user_uefj" 
 PAYMENT_CARDS = ["5355 2800 2484 3821", "5232 4410 2403 2182"]
 
-# --- СОСТОЯНИЯ ---
-class Order(StatesGroup): prod = State(); weight = State(); promo_choice = State(); promo_enter = State(); check = State()
-class UserSup(StatesGroup): wait_q = State()
-class AdminSup(StatesGroup): in_chat = State(); target = State()
-class Auth(StatesGroup): captcha = State()
-class AdminFSM(StatesGroup): broadcast = State(); promo_name = State(); promo_perc = State()
+# ВСТАВЬ СВОЙ URL ПОСТГРЕСА ТУТ
+DB_URL = "postgresql://shop_db_user_user:PbLeivrMYwfcB8qFfL2VdbVXRKFNbZ89@dpg-d5cq2heuk2gs738ej7og-a/shop_db_user"
 
-router = Router()
+# ----------------------------------------------------------------------
+# --- ЛОГИКА БД (PostgreSQL) ---
+# ----------------------------------------------------------------------
 
-# --- БД POSTGRESQL ---
-def db_query(sql, params=(), fetch=False, fetch_all=False):
+def get_db_connection():
+    # Исправляем протокол для psycopg2
+    url = DB_URL.replace("postgres://", "postgresql://")
+    return psycopg2.connect(url)
+
+def db_query(sql, params=(), fetch=False, fetch_all=False, commit=True):
+    conn = None
     try:
-        with psycopg2.connect(DB_URL) as conn:
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                cur.execute(sql, params)
-                if fetch: return dict(cur.fetchone()) if cur.rowcount > 0 else None
-                if fetch_all: return [dict(r) for r in cur.fetchall()]
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=DictCursor) as cur:
+            cur.execute(sql, params)
+            if fetch:
+                row = cur.fetchone()
+                return dict(row) if row else None
+            if fetch_all:
+                return [dict(r) for r in cur.fetchall()]
+            if commit:
                 conn.commit()
-                return cur.rowcount
+            return cur.rowcount
     except Exception as e:
-        logging.error(f"DB Error: {e}")
+        logging.error(f"DATABASE ERROR: {e}")
         return None
+    finally:
+        if conn: conn.close()
 
 def init_db():
     queries = [
-        "CREATE TABLE IF NOT EXISTS users (user_id BIGINT PRIMARY KEY, username TEXT, referrer_id BIGINT, referral_count INTEGER DEFAULT 0, has_purchased BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE IF NOT EXISTS orders (order_id TEXT PRIMARY KEY, short_id TEXT, user_id BIGINT, username TEXT, product TEXT, weight TEXT, final_price INTEGER, check_file_id TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
-        "CREATE TABLE IF NOT EXISTS products (id SERIAL PRIMARY KEY, product_name TEXT, weight TEXT, price INTEGER)",
-        "CREATE TABLE IF NOT EXISTS promo_codes (code TEXT PRIMARY KEY, discount INTEGER)",
-        "CREATE TABLE IF NOT EXISTS blacklist (user_id BIGINT PRIMARY KEY, reason TEXT)"
+        """CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY, username TEXT, referrer_id BIGINT,
+            referral_count INTEGER DEFAULT 0, has_purchased INTEGER DEFAULT 0,
+            blocked_bot INTEGER DEFAULT 0, first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY, short_id TEXT, user_id BIGINT, username TEXT,
+            product TEXT, weight TEXT, final_price INTEGER, original_price INTEGER,
+            promo_code_used TEXT, contact_info TEXT, check_file_id TEXT,
+            status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        """CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY, category_name TEXT, product_name TEXT, weight TEXT, price INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY, discount_percent INTEGER, is_reusable INTEGER DEFAULT 1
+        )""",
+        """CREATE TABLE IF NOT EXISTS blacklist (
+            user_id BIGINT PRIMARY KEY, reason TEXT, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )"""
     ]
     for q in queries: db_query(q)
     
-    db_query("DELETE FROM products")
-    items = [
-        ("Шишки АК-47 (ИНДИКА)", "1.0г", 400), ("Шишки АК-47 (ИНДИКА)", "2.0г", 750),
-        ("Шишки АК-47 (САТИВА)", "1.0г", 450), ("Шишки АК-47 (САТИВА)", "2.0г", 850),
-        ("Гашиш АФГАН", "1.0г", 500), ("Гашиш АФГАН", "3.0г", 1350),
-        ("Киф АФГАН", "1.0г", 600), ("Амфетамин VHQ", "1.0г", 700),
-        ("Мефедрон VHQ", "1.0г", 700), ("Метадон Уличный", "1.0г", 800),
-        ("Экстази Домино", "1 шт", 450), ("Грибы", "1.0г", 450),
-        ("ЛСД-300", "1 шт", 500), ("МДМА", "1.0г", 500),
-        ("Alfa pvp", "1.0г", 600), ("Гер", "0.5г", 900),
-        ("Винт", "5мг", 1200), ("Мушрум", "1 шт", 450),
-        ("Кетамин", "1.0г", 500), ("D-meth", "0.25г", 600),
-        ("Кокаїн", "0.25г", 1000)
-    ]
-    for p in items: db_query("INSERT INTO products (product_name, weight, price) VALUES (%s, %s, %s)", p)
+    # Первичные товары если пусто
+    if not db_query("SELECT 1 FROM products LIMIT 1", fetch=True):
+        db_query("INSERT INTO products (category_name, product_name, weight, price) VALUES (%s, %s, %s, %s)", 
+                 ("Шишки", "AK-47", "1.0г", 400))
 
+# ----------------------------------------------------------------------
+# --- СОСТОЯНИЯ (FSM) ---
+# ----------------------------------------------------------------------
+
+class AuthStates(StatesGroup): waiting_for_captcha = State()
+class UserSupport(StatesGroup): waiting_for_question = State(); in_support = State()
+class AdminStates(StatesGroup): 
+    in_support = State(); waiting_for_broadcast = State()
+    add_prod_cat = State(); add_prod_name = State(); add_prod_weight = State(); add_prod_price = State()
+class OrderStates(StatesGroup): 
+    waiting_for_category = State(); waiting_for_product = State()
+    waiting_for_weight = State(); waiting_for_promo = State()
+    waiting_for_pay_check = State(); waiting_for_contact = State()
+
+# ----------------------------------------------------------------------
 # --- КЛАВИАТУРЫ ---
-def kb_main():
-    b = InlineKeyboardBuilder()
-    b.button(text="🛍️ КАТАЛОГ", callback_data="catalog")
-    b.button(text="👤 МОЙ ПРОФИЛЬ", callback_data="profile")
-    b.button(text="💬 ПОДДЕРЖКА", callback_data="support")
-    return b.adjust(1).as_markup()
+# ----------------------------------------------------------------------
 
+def get_main_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🛍️ Каталог", callback_data="show_catalog")
+    kb.button(text="👤 Профиль / Рефералы", callback_data="show_profile")
+    kb.button(text="💬 Написать Админу", callback_data="start_support")
+    return kb.adjust(1).as_markup()
+
+def get_admin_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📊 Статистика", callback_data="adm_stats")
+    kb.button(text="📣 Рассылка", callback_data="adm_broadcast")
+    kb.button(text="📦 Добавить Товар", callback_data="adm_add_prod")
+    kb.button(text="🚫 Бан по ID", callback_data="adm_ban")
+    return kb.adjust(1).as_markup()
+
+# ----------------------------------------------------------------------
 # --- ХЕНДЛЕРЫ ---
+# ----------------------------------------------------------------------
+
+router = Router()
+
 @router.message(CommandStart())
 async def cmd_start(m: types.Message, state: FSMContext):
-    await state.clear()
-    u = db_query("SELECT * FROM users WHERE user_id=%s", (m.from_user.id,), fetch=True)
-    if u: await m.answer(f"👋 Привет, {m.from_user.first_name}!", reply_markup=kb_main())
+    user = db_query("SELECT * FROM users WHERE user_id = %s", (m.from_user.id,), fetch=True)
+    if user:
+        await m.answer(f"С возвращением, {m.from_user.first_name}!", reply_markup=get_main_menu_kb())
     else:
-        n1, n2 = random.randint(1,9), random.randint(1,9)
-        ref = int(m.text.split()[1]) if len(m.text.split()) > 1 and m.text.split()[1].isdigit() else None
-        await state.update_data(ans=n1+n2, ref=ref)
-        await state.set_state(Auth.captcha)
-        await m.answer(f"🛡️ Решите пример: `{n1} + {n2} = ?`", parse_mode="Markdown")
+        ref_id = None
+        args = m.text.split()
+        if len(args) > 1 and args[1].isdigit(): ref_id = int(args[1])
+        
+        n1, n2 = random.randint(1, 10), random.randint(1, 10)
+        await state.update_data(ans=n1+n2, ref=ref_id)
+        await state.set_state(AuthStates.waiting_for_captcha)
+        await m.answer(f"🛡️ Капча: {n1} + {n2} = ?")
 
-@router.message(Auth.captcha)
-async def check_captcha(m: types.Message, state: FSMContext):
+@router.message(AuthStates.waiting_for_captcha)
+async def captcha_done(m: types.Message, state: FSMContext):
     data = await state.get_data()
     if m.text == str(data.get('ans')):
-        db_query("INSERT INTO users (user_id, username, referrer_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (m.from_user.id, m.from_user.username, data.get('ref')))
-        await state.clear(); await m.answer("✅ Доступ открыт!", reply_markup=kb_main())
-    else: await m.answer("❌ Ошибка. /start")
+        db_query("INSERT INTO users (user_id, username, referrer_id) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                 (m.from_user.id, m.from_user.username, data.get('ref')))
+        await state.clear()
+        await m.answer("✅ Доступ открыт!", reply_markup=get_main_menu_kb())
+    else: await m.answer("❌ Неверно.")
 
 # --- КАТАЛОГ ---
-@router.callback_query(F.data == "catalog")
-async def catalog(call: types.CallbackQuery, state: FSMContext):
-    prods = db_query("SELECT DISTINCT product_name FROM products", fetch_all=True)
-    b = InlineKeyboardBuilder()
-    for p in prods: b.button(text=p['product_name'], callback_data=f"p:{p['product_name']}")
-    await state.set_state(Order.prod)
-    await call.message.edit_text("🛒 Выберите товар:", reply_markup=b.adjust(1).as_markup())
+@router.callback_query(F.data == "show_catalog")
+async def cat_list(call: types.CallbackQuery, state: FSMContext):
+    cats = db_query("SELECT DISTINCT category_name FROM products", fetch_all=True)
+    kb = InlineKeyboardBuilder()
+    for c in cats: kb.button(text=c['category_name'], callback_data=f"cat:{c['category_name']}")
+    await call.message.edit_text("Выберите категорию:", reply_markup=kb.adjust(1).as_markup())
+    await state.set_state(OrderStates.waiting_for_category)
 
-@router.callback_query(F.data.startswith("p:"), Order.prod)
-async def weights(call: types.CallbackQuery, state: FSMContext):
-    pn = call.data.split(":")[1]
-    vs = db_query("SELECT id, weight, price FROM products WHERE product_name=%s", (pn,), fetch_all=True)
-    b = InlineKeyboardBuilder()
-    for v in vs: b.button(text=f"{v['weight']} — {v['price']} грн", callback_data=f"w:{v['id']}")
-    await state.set_state(Order.weight)
-    await call.message.edit_text(f"💎 {pn}:", reply_markup=b.adjust(1).as_markup())
+@router.callback_query(F.data.startswith("cat:"), OrderStates.waiting_for_category)
+async def prod_list(call: types.CallbackQuery, state: FSMContext):
+    cat = call.data.split(":")[1]
+    prods = db_query("SELECT DISTINCT product_name FROM products WHERE category_name = %s", (cat,), fetch_all=True)
+    kb = InlineKeyboardBuilder()
+    for p in prods: kb.button(text=p['product_name'], callback_data=f"prod:{p['product_name']}")
+    await call.message.edit_text(f"Товары в {cat}:", reply_markup=kb.adjust(1).as_markup())
+    await state.set_state(OrderStates.waiting_for_product)
 
-# --- НОВАЯ СИСТЕМА ПРОМОКОДОВ ---
-@router.callback_query(F.data.startswith("w:"), Order.weight)
+@router.callback_query(F.data.startswith("prod:"), OrderStates.waiting_for_product)
+async def weight_list(call: types.CallbackQuery, state: FSMContext):
+    p_name = call.data.split(":")[1]
+    items = db_query("SELECT id, weight, price FROM products WHERE product_name = %s", (p_name,), fetch_all=True)
+    kb = InlineKeyboardBuilder()
+    for i in items: kb.button(text=f"{i['weight']} - {i['price']} грн", callback_data=f"id:{i['id']}")
+    await state.update_data(cur_prod=p_name)
+    await call.message.edit_text("Выберите фасовку:", reply_markup=kb.adjust(1).as_markup())
+    await state.set_state(OrderStates.waiting_for_weight)
+
+@router.callback_query(F.data.startswith("id:"), OrderStates.waiting_for_weight)
 async def ask_promo(call: types.CallbackQuery, state: FSMContext):
-    it = db_query("SELECT * FROM products WHERE id=%s", (int(call.data.split(":")[1]),), fetch=True)
-    await state.update_data(it=it, price=it['price'])
-    
-    b = InlineKeyboardBuilder()
-    b.button(text="✅ Да, есть", callback_data="promo:yes")
-    b.button(text="❌ Нет", callback_data="promo:no")
-    await state.set_state(Order.promo_choice)
-    await call.message.edit_text("🎫 У вас есть промокод на скидку?", reply_markup=b.as_markup())
+    p_id = call.data.split(":")[1]
+    item = db_query("SELECT * FROM products WHERE id = %s", (p_id,), fetch=True)
+    await state.update_data(p_name=item['product_name'], p_weight=item['weight'], p_price=item['price'])
+    await state.set_state(OrderStates.waiting_for_promo)
+    kb = InlineKeyboardBuilder().button(text="Пропустить", callback_data="skip_promo").as_markup()
+    await call.message.edit_text("🎟️ Введите промокод (если есть) или нажмите пропустить:", reply_markup=kb)
 
-@router.callback_query(F.data == "promo:yes", Order.promo_choice)
-async def enter_promo(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(Order.promo_enter)
-    await call.message.edit_text("⌨️ Введите ваш промокод:")
-
-@router.message(Order.promo_enter)
-async def check_promo(m: types.Message, state: FSMContext):
-    promo = db_query("SELECT * FROM promo_codes WHERE code=%s", (m.text.strip(),), fetch=True)
-    data = await state.get_data()
-    
-    if promo:
-        discount = promo['discount']
-        new_price = int(data['price'] * (1 - discount / 100))
-        await state.update_data(price=new_price)
-        await m.answer(f"✅ Промокод принят! Скидка {discount}%\nНовая цена: {new_price} грн")
-    else:
-        await m.answer("❌ Промокод не найден или истек. Цена остается прежней.")
-    
-    await proceed_to_payment(m, state)
-
-@router.callback_query(F.data == "promo:no", Order.promo_choice)
-async def no_promo(call: types.CallbackQuery, state: FSMContext):
-    await proceed_to_payment(call.message, state)
-
-async def proceed_to_payment(m, state: FSMContext):
+@router.callback_query(F.data == "skip_promo", OrderStates.waiting_for_promo)
+async def skip_pr(call: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     card = random.choice(PAYMENT_CARDS)
-    await state.set_state(Order.check)
-    txt = (f"💳 **ОПЛАТА**\n\nТовар: {data['it']['product_name']} ({data['it']['weight']})\n"
-           f"💰 К оплате: `{data['price']} грн`\n\nРеквизиты:\n`{card}`\n\nПришлите фото чека:")
-    if isinstance(m, types.Message): await m.answer(txt, parse_mode="Markdown")
-    else: await m.edit_text(txt, parse_mode="Markdown")
+    await call.message.edit_text(f"💳 К оплате: {data['p_price']} грн\nРеквизиты: `{card}`\n\nПришлите ФОТО чека.")
+    await state.set_state(OrderStates.waiting_for_pay_check)
 
-# --- ХЕНДЛЕР ЧЕКА ---
-@router.message(Order.check, F.photo)
-async def get_check(m: types.Message, state: FSMContext, bot: Bot):
-    d = await state.get_data(); oid = str(uuid.uuid4())[:8]
-    db_query("INSERT INTO orders (order_id, short_id, user_id, username, product, weight, final_price, check_file_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-             (str(uuid.uuid4()), oid, m.from_user.id, m.from_user.username, d['it']['product_name'], d['it']['weight'], d['price'], m.photo[-1].file_id))
-    
-    kb = InlineKeyboardBuilder().button(text="✅ Одобрить", callback_data=f"ok:{oid}").button(text="❌ Отклонить", callback_data=f"no:{oid}")
-    for a in ADMIN_IDS:
-        try: await bot.send_photo(a, m.photo[-1].file_id, caption=f"🆕 #{oid}\n💰 {d['price']} грн\n👤 @{m.from_user.username}", reply_markup=kb.as_markup())
-        except: pass
-    await m.answer(f"⏳ Чек #{oid} отправлен на проверку!"); await state.clear()
+# --- ПРОФИЛЬ И РЕФЕРАЛЫ ---
+@router.callback_query(F.data == "show_profile")
+async def profile(call: types.CallbackQuery, bot: Bot):
+    u = db_query("SELECT * FROM users WHERE user_id = %s", (call.from_user.id,), fetch=True)
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start={u['user_id']}"
+    text = (f"👤 Профиль: {u['user_id']}\n"
+            f"📈 Рефералов: {u['referral_count']} / 5\n"
+            f"🎁 Сделаешь 5 рефов - получишь купон 75%\n\n"
+            f"🔗 Твоя ссылка: `{link}`")
+    await call.message.edit_text(text, reply_markup=get_main_menu_kb())
 
-# --- АДМИНКА: СОЗДАНИЕ ПРОМОКОДОВ ---
-@router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
-async def adm_panel(m: types.Message):
-    b = InlineKeyboardBuilder()
-    b.button(text="📢 Рассылка", callback_data="adm:bc")
-    b.button(text="🎫 Создать промокод", callback_data="adm:promo")
-    b.button(text="📊 Статистика", callback_data="adm:stats")
-    await m.answer("🔧 АДМИН-ПАНЕЛЬ", reply_markup=b.adjust(1).as_markup())
+# --- ПОДДЕРЖКА (LIVE CHAT) ---
+@router.callback_query(F.data == "start_support")
+async def sup_start(call: types.CallbackQuery, state: FSMContext):
+    await state.set_state(UserSupport.waiting_for_question)
+    await call.message.edit_text("💬 Опишите ваш вопрос одним сообщением:")
 
-@router.callback_query(F.data == "adm:promo", F.from_user.id.in_(ADMIN_IDS))
-async def adm_promo_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.promo_name)
-    await call.message.answer("Введите название промокода (например, SALE20):")
+@router.message(UserSupport.waiting_for_question)
+async def sup_msg(m: types.Message, state: FSMContext, bot: Bot):
+    for adm in ADMIN_IDS:
+        kb = InlineKeyboardBuilder().button(text="Ответить", callback_data=f"ans_u:{m.from_user.id}").as_markup()
+        await bot.send_message(adm, f"❓ Вопрос от @{m.from_user.username} ({m.from_user.id}):\n{m.text}", reply_markup=kb)
+    await m.answer("✅ Отправлено. Ждите ответа.")
+    await state.set_state(UserSupport.in_support)
 
-@router.message(AdminFSM.promo_name)
-async def adm_promo_name(m: types.Message, state: FSMContext):
-    await state.update_data(p_name=m.text.strip())
-    await state.set_state(AdminFSM.promo_perc)
-    await m.answer("Введите процент скидки (только число, например 15):")
+@router.callback_query(F.data.startswith("ans_u:"), F.from_user.id.in_(ADMIN_IDS))
+async def adm_ans_start(call: types.CallbackQuery, state: FSMContext):
+    uid = int(call.data.split(":")[1])
+    await state.update_data(chat_uid=uid)
+    await state.set_state(AdminStates.in_support)
+    await call.message.answer(f"Пиши ответ для {uid}. Чтобы выйти - /cancel")
 
-@router.message(AdminFSM.promo_perc)
-async def adm_promo_final(m: types.Message, state: FSMContext):
-    if not m.text.isdigit(): return await m.answer("Введите число!")
+@router.message(AdminStates.in_support, F.from_user.id.in_(ADMIN_IDS))
+async def adm_sending(m: types.Message, state: FSMContext, bot: Bot):
+    if m.text == "/cancel": 
+        await state.clear(); await m.answer("Вышли из чата"); return
     data = await state.get_data()
-    db_query("INSERT INTO promo_codes (code, discount) VALUES (%s, %s) ON CONFLICT (code) DO UPDATE SET discount=%s", 
-             (data['p_name'], int(m.text), int(m.text)))
+    try:
+        await bot.send_message(data['chat_uid'], f"👨‍💻 Ответ от админа:\n{m.text}")
+        await m.answer("✅ Отправлено")
+    except: await m.answer("❌ Ошибка")
+
+# --- ОПЛАТА И ПРОВЕРКА ЗАКАЗА ---
+@router.message(F.photo, OrderStates.waiting_for_pay_check)
+async def get_check(m: types.Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    oid = str(uuid.uuid4())[:8]
+    db_query("INSERT INTO orders (order_id, short_id, user_id, username, product, weight, final_price, check_file_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+             (oid, oid, m.from_user.id, m.from_user.username, data['p_name'], data['p_weight'], data['p_price'], m.photo[-1].file_id))
+    
+    for adm in ADMIN_IDS:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Одобрить", callback_data=f"ok:{oid}")
+        kb.button(text="❌ Отказ", callback_data=f"no:{oid}")
+        await bot.send_photo(adm, m.photo[-1].file_id, caption=f"📦 Заказ #{oid}\nЮзер: @{m.from_user.username}\n{data['p_name']} {data['p_weight']}", reply_markup=kb.adjust(2).as_markup())
+    
+    await m.answer("⏳ Чек принят. Ожидайте подтверждения.")
     await state.clear()
-    await m.answer(f"✅ Промокод `{data['p_name']}` на {m.text}% успешно создан!", parse_mode="Markdown")
-
-# --- ОСТАЛЬНЫЕ АДМИН-ФУНКЦИИ (Рассылка, Одобрение) ---
-@router.callback_query(F.data == "adm:bc", F.from_user.id.in_(ADMIN_IDS))
-async def bc_start(call: types.CallbackQuery, state: FSMContext):
-    await state.set_state(AdminFSM.broadcast); await call.message.answer("📢 Введите текст рассылки:")
-
-@router.message(AdminFSM.broadcast, F.from_user.id.in_(ADMIN_IDS))
-async def bc_do(m: types.Message, state: FSMContext):
-    users = db_query("SELECT user_id FROM users", fetch_all=True)
-    for u in users:
-        try: await m.copy_to(u['user_id']); await asyncio.sleep(0.05)
-        except: pass
-    await state.clear(); await m.answer("✅ Рассылка завершена.")
 
 @router.callback_query(F.data.startswith("ok:"), F.from_user.id.in_(ADMIN_IDS))
-async def approve(call: types.CallbackQuery, bot: Bot):
+async def order_ok(call: types.CallbackQuery, bot: Bot):
     oid = call.data.split(":")[1]
-    o = db_query("SELECT * FROM orders WHERE short_id=%s", (oid,), fetch=True)
-    if o:
-        db_query("UPDATE orders SET status='ok' WHERE short_id=%s", (oid,))
-        try: await bot.send_message(o['user_id'], f"✅ Заказ #{oid} подтвержден!")
-        except: pass
-        await call.message.edit_caption(caption=f"✅ Заказ {oid} Одобрен")
+    order = db_query("SELECT * FROM orders WHERE order_id = %s", (oid,), fetch=True)
+    db_query("UPDATE orders SET status = 'confirmed' WHERE order_id = %s", (oid,))
+    
+    # Рефералка: если первая покупка
+    u = db_query("SELECT * FROM users WHERE user_id = %s", (order['user_id'],), fetch=True)
+    if u['has_purchased'] == 0 and u['referrer_id']:
+        db_query("UPDATE users SET has_purchased = 1 WHERE user_id = %s", (order['user_id'],))
+        ref_id = u['referrer_id']
+        db_query("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = %s", (ref_id,))
+        
+        # Проверка на 5 рефов
+        ref_data = db_query("SELECT referral_count FROM users WHERE user_id = %s", (ref_id,), fetch=True)
+        if ref_data['referral_count'] >= 5:
+            promo = f"REF-{random.randint(100,999)}"
+            db_query("INSERT INTO promo_codes (code, discount_percent, is_reusable) VALUES (%s, 75, 0)", (promo,))
+            db_query("UPDATE users SET referral_count = 0 WHERE user_id = %s", (ref_id,))
+            try: await bot.send_message(ref_id, f"🎁 Твой бонус за 5 друзей! Купон 75%: `{promo}`")
+            except: pass
 
-# --- СТАРТ ---
+    await bot.send_message(order['user_id'], f"✅ Твой заказ #{oid} одобрен! Курьер выезжает.")
+    await call.message.edit_caption(caption=call.message.caption + "\n\nСТАТУС: ✅ ОДОБРЕНО")
+
+# --- ЗАПУСК ---
 async def main():
     logging.basicConfig(level=logging.INFO)
+    init_db()
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
-    dp = Dispatcher(storage=MemoryStorage()); dp.include_router(router); init_db()
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.include_router(router)
+    
+    # Middleware проверки бана
+    @dp.message.middleware()
+    async def check_ban(handler, event, data):
+        if db_query("SELECT 1 FROM blacklist WHERE user_id = %s", (event.from_user.id,), fetch=True):
+            return
+        return await handler(event, data)
+
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
