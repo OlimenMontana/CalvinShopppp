@@ -3,7 +3,7 @@ import logging
 import re
 import uuid 
 import random 
-# sqlite disabled, using PostgreSQL # Для базы данных
+import sqlite3 # Для базы данных
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import CommandStart, StateFilter, Command
 from aiogram.fsm.context import FSMContext
@@ -26,11 +26,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
 
-_pg_pool = pool.ThreadedConnectionPool(
-    minconn=1,
-    maxconn=5,
-    dsn=DATABASE_URL
-)
+_pg_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
 
 class sqlite_connect_replacement:
     def __enter__(self):
@@ -44,7 +40,6 @@ class sqlite_connect_replacement:
             self.conn.commit()
         _pg_pool.putconn(self.conn)
 # =========================================
-
 
 # --- Конфигурация ---
 # !!!
@@ -160,7 +155,7 @@ def is_user_verified(user_id: int) -> bool:
 def get_user_data_db(user_id: int) -> dict | None:
     """Получает все данные о пользователе"""
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
@@ -277,14 +272,13 @@ def create_db_order(order_data: dict) -> str:
 
 def get_pending_orders_db() -> list:
     with sqlite_connect_replacement(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row 
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM orders WHERE status = 'pending' ORDER BY created_at ASC")
         return [dict(row) for row in cursor.fetchall()]
 
 def get_order_db(order_id: str) -> dict | None:
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
@@ -320,14 +314,14 @@ def del_promo_db(code: str) -> bool:
 
 def get_promo_db(code: str) -> dict | None:
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM promo_codes WHERE code = ?", (code.upper(),))
         row = cursor.fetchone()
         return dict(row) if row else None
 
 def get_all_promos_db() -> list:
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM promo_codes")
         return [dict(row) for row in cursor.fetchall()]
 
@@ -412,14 +406,14 @@ def get_products_by_category_db(category_name: str) -> list[str]:
 def get_weights_for_product_db(product_name: str) -> list[dict]:
     """Возвращает список весов и цен (id, weight, price) для товара"""
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT id, weight, price, category_name FROM products WHERE product_name = ? ORDER BY price", (product_name,))
         return [dict(row) for row in cursor.fetchall()]
 
 def get_product_by_id_db(product_id: int) -> dict | None:
     """Возвращает один товар по его ID"""
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM products WHERE id = ?", (product_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
@@ -442,7 +436,7 @@ def add_product_db(category: str, name: str, weight: str, price: int) -> bool:
 def get_all_products_full_db() -> list[dict]:
     """Возвращает ПОЛНЫЙ список всех товаров для админки"""
     with sqlite_connect_replacement(DB_FILE) as conn:
-                cursor = conn.cursor()
+        cursor = conn.cursor()
         cursor.execute("SELECT * FROM products ORDER BY category_name, product_name, price")
         return [dict(row) for row in cursor.fetchall()]
 
