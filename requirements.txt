@@ -1,2 +1,3 @@
 aiogram
 flask
+psycopg2-binary
